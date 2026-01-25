@@ -23,11 +23,11 @@ clone_model = Qwen3TTSModel.from_pretrained(
 start = log_time(start, "Load Base model")
 
 # for real speedup, use vLLM for LM inference (or SGlang probably)
-# torch.compile doesn't help much for autoregressive generation due to dynamic shapes ( I think but idk )
+# torch.compile doesn't help much for autoregressive generation due to dynamic shapes
 
-ref_audio_path = "neurona-10sec (3).wav"
+ref_audio_path = "ref-audio.wav"
 ref_text = (
-    "реф текст"
+    "ref text"
 )
 
 voice_clone_prompt = clone_model.create_voice_clone_prompt(
@@ -37,14 +37,14 @@ voice_clone_prompt = clone_model.create_voice_clone_prompt(
 start = log_time(start, "Create voice clone prompt")
 
 # Test sentence
-test_text = "Привет всем! Я того всё ебала, что за новый голос тут на обзоре у вилсакома? А? Так он мне понравился. Ганс оф буллщит."
+test_text = "Hello! This is the test text"
 
 # ============== Standard generation ==============
 print("\n--- Standard generation ---")
 start = time.time()
 wavs, sr = clone_model.generate_voice_clone(
     text=test_text,
-    language="Russian",
+    language="English",
     voice_clone_prompt=voice_clone_prompt,
 )
 standard_time = time.time() - start
@@ -60,7 +60,7 @@ chunk_count = 0
 
 for chunk, chunk_sr in clone_model.stream_generate_voice_clone(
     text=test_text,
-    language="Russian",
+    language="English",
     voice_clone_prompt=voice_clone_prompt,
     emit_every_frames=8,
     decode_window_frames=80,
