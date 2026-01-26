@@ -48,7 +48,7 @@ print("\n--- Standard generation ---")
 start = time.time()
 wavs, sr = clone_model.generate_voice_clone(
     text=test_text,
-    language="English",
+    language="Russian",
     voice_clone_prompt=voice_clone_prompt,
 )
 standard_time = time.time() - start
@@ -64,7 +64,7 @@ chunk_count = 0
 
 for chunk, chunk_sr in clone_model.stream_generate_voice_clone(
     text=test_text,
-    language="English",
+    language="Russian",
     voice_clone_prompt=voice_clone_prompt,
     emit_every_frames=8,
     decode_window_frames=80,
