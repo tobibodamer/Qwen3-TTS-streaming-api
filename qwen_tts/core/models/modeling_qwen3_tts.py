@@ -2605,6 +2605,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         max_frames: int = 10000,
         # Optimization flags
         use_optimized_decode: bool = True,
+        # Two-phase streaming: aggressive first chunk
+        first_chunk_emit_every: int = 0,  # 0 = disabled, use emit_every_frames throughout
+        first_chunk_decode_window: int = 48,
+        first_chunk_frames: int = 48,  # Switch to stable after this many frames
     ) -> Generator[tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation, yielding PCM chunks as they are generated.
@@ -2627,6 +2631,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             overlap_samples: Overlap samples for crossfade between chunks
             max_frames: Maximum number of codec frames to generate
             use_optimized_decode: Use CUDA graph optimized decode when available (default True)
+            first_chunk_emit_every: Emit interval for first chunk phase (0 = disabled, use emit_every_frames)
+            first_chunk_decode_window: Decode window size for first chunk phase
+            first_chunk_frames: Switch to stable settings after this many frames
 
         Yields:
             tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -2751,22 +2758,36 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 token = torch.argmax(step_logits, dim=-1)
 
             frames_since_emit += 1
-            if frames_since_emit < emit_every_frames:
+
+            # Two-phase streaming: determine current phase settings
+            total_frames_generated = len(codes_buffer)
+            if first_chunk_emit_every > 0 and total_frames_generated < first_chunk_frames:
+                # Phase 1: Aggressive settings for first chunk (lower latency)
+                current_emit_every = first_chunk_emit_every
+                current_decode_window = first_chunk_decode_window
+                current_use_optimized = False  # Non-optimized allows flexible window size
+            else:
+                # Phase 2: Stable settings (better quality)
+                current_emit_every = emit_every_frames
+                current_decode_window = decode_window_frames
+                current_use_optimized = use_optimized_decode
+
+            if frames_since_emit < current_emit_every:
                 continue
             frames_since_emit = 0
 
             # Decode window of codec frames to PCM
-            start = max(0, len(codes_buffer) - decode_window_frames)
+            start = max(0, len(codes_buffer) - current_decode_window)
             window_codes = torch.stack(codes_buffer[start:], dim=0)  # [T, num_code_groups]
 
             # Add ref_code as context prefix for stable decoder context from the start
             window, _ = _add_ref_code_context(
-                window_codes, ref_code_context, ref_code_frames, decode_window_frames
+                window_codes, ref_code_context, ref_code_frames, current_decode_window
             )
 
             # Use optimized decode path when available
             # Pass pad_to_size to ensure fixed tensor size for torch.compile
-            if use_optimized_decode and hasattr(self.speech_tokenizer, 'decode_streaming'):
+            if current_use_optimized and hasattr(self.speech_tokenizer, 'decode_streaming'):
                 wavs, sr = self.speech_tokenizer.decode_streaming(
                     window.to(self.talker.device),
                     use_optimized=True,
@@ -2781,7 +2802,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Extract only new samples (tail of decoded window)
             # Use fixed upsample rate to avoid floating-point drift
             samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
-            step_samples = samples_per_frame * emit_every_frames
+            step_samples = samples_per_frame * current_emit_every
             chunk = wav[-step_samples:] if step_samples > 0 else wav
 
             # Crossfade with previous chunk tail for smooth transition

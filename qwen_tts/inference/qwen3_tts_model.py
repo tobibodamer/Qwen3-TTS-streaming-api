@@ -700,6 +700,10 @@ class Qwen3TTSModel:
         max_frames: int = 10000,
         # Optimization
         use_optimized_decode: bool = True,
+        # Two-phase streaming: aggressive first chunk
+        first_chunk_emit_every: int = 0,  # 0 = disabled, use emit_every_frames throughout
+        first_chunk_decode_window: int = 48,
+        first_chunk_frames: int = 48,  # Switch to stable after this many frames
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -721,6 +725,9 @@ class Qwen3TTSModel:
             max_frames: Maximum codec frames to generate.
             use_optimized_decode: Use CUDA graph optimized decode when available (default True).
                                   Call enable_streaming_optimizations() first for best performance.
+            first_chunk_emit_every: Emit interval for first chunk phase (0 = disabled).
+            first_chunk_decode_window: Decode window size for first chunk phase.
+            first_chunk_frames: Switch to stable settings after this many frames.
             **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
 
         Yields:
@@ -798,6 +805,9 @@ class Qwen3TTSModel:
             overlap_samples=overlap_samples,
             max_frames=max_frames,
             use_optimized_decode=use_optimized_decode,
+            first_chunk_emit_every=first_chunk_emit_every,
+            first_chunk_decode_window=first_chunk_decode_window,
+            first_chunk_frames=first_chunk_frames,
             **gen_kwargs,
         ):
             yield chunk, sr
