@@ -2527,6 +2527,17 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         repetition_penalty: float = 1.05,
         **kwargs,
     ):
+        # Multiple EOS tokens that can terminate generation
+        eos_ids = {
+            self.config.talker_config.codec_eos_token_id,  # Primary codec EOS
+            2150,    # Codec EOS (model-specific)
+            2157,    # Secondary codec token
+            151670,  # TTS special token
+            self.config.tts_eos_token_id,   # 151673
+            self.config.im_end_token_id,    # 151645
+            151643,  # <|endoftext|>
+        }
+
         talker_kwargs = {
             "max_new_tokens": max_new_tokens,
             "min_new_tokens": 2,
@@ -2534,7 +2545,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "top_k": top_k,
             "top_p": top_p,
             "temperature": temperature,
-            "subtalker_dosample": subtalker_dosample, 
+            "subtalker_dosample": subtalker_dosample,
             "subtalker_top_k": subtalker_top_k,
             "subtalker_top_p": subtalker_top_p,
             "subtalker_temperature": subtalker_temperature,
@@ -2545,7 +2556,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "suppress_tokens": [
                 i
                 for i in range(self.config.talker_config.vocab_size - 1024, self.config.talker_config.vocab_size)
-                if i not in (self.config.talker_config.codec_eos_token_id,)
+                if i not in eos_ids
             ],
             "output_hidden_states": kwargs.get("output_hidden_states", True),
             "return_dict_in_generate": kwargs.get("return_dict_in_generate", True)
@@ -2576,7 +2587,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         talker_hidden_states = torch.cat([hid[0][-1][:, -1:] for hid in talker_result.hidden_states], dim=1)[:, :-1]
         
         first_codebook = talker_codes[:, :, 0]
-        is_stop_token = (first_codebook ==  self.config.talker_config.codec_eos_token_id)
+        # Check against all EOS tokens
+        eos_ids_tensor = torch.tensor(list(eos_ids), device=first_codebook.device, dtype=first_codebook.dtype)
+        is_stop_token = torch.isin(first_codebook, eos_ids_tensor)
         stop_indices = torch.argmax(is_stop_token.int(), dim=1)
         has_stop_token = is_stop_token.any(dim=1)
         effective_lengths = torch.where(has_stop_token, stop_indices, talker_codes.shape[1])
@@ -2658,13 +2671,23 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 non_streaming_mode=non_streaming_mode,
             )
 
-        eos_id = self.config.talker_config.codec_eos_token_id
+        # Multiple EOS tokens that can terminate generation
+        # Some models may emit different EOS tokens depending on context
+        eos_ids = {
+            self.config.talker_config.codec_eos_token_id,  # Primary codec EOS
+            2150,    # Codec EOS (model-specific)
+            2157,    # Secondary codec token
+            151670,  # TTS special token
+            self.config.tts_eos_token_id,   # 151673
+            self.config.im_end_token_id,    # 151645
+            151643,  # <|endoftext|>
+        }
 
         # Build suppress_tokens list (same as in generate())
         vocab_size = self.config.talker_config.vocab_size
         suppress_tokens = [
             i for i in range(vocab_size - 1024, vocab_size)
-            if i != eos_id
+            if i not in eos_ids
         ]
 
         # Mark step begin for CUDA graphs (required for torch.compile with reduce-overhead)
@@ -2750,9 +2773,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Get codec_ids from hidden_states tuple: (layer_outputs, codec_ids)
             codec_ids = step_out.hidden_states[1]  # [B, num_code_groups]
 
-            # Check for EOS in first codebook ON GPU (avoids CPU sync bottleneck)
+            # Check for EOS in first codebook
             # EOS token is out of range for speech tokenizer, so we must not include it
-            if codec_ids[0, 0] == eos_id:
+            if codec_ids[0, 0].item() in eos_ids:
                 break
 
             # Keep on GPU to avoid CPU<->GPU transfers during decode
