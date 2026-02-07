@@ -10,8 +10,10 @@ From [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streamin
 - `torch.compile` + CUDA graphs optimization
 
 Added in this fork:
-- **Two-phase streaming** - faster first-chunk latency (2.75x improvement)
-- **Audio quality fixes** - click-free chunk blending with Hann crossfade
+- **Two-phase streaming** - faster first-chunk latency
+- **Repetition penalty for streaming** - prevents token loops that cause looping audio and runaway generation. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path (which defaults to 1.05)
+- **Multiple EOS token detection** - broader termination coverage for reliable generation stopping
+- **Hann window crossfade** - click-free chunk boundaries with proper fade-in/fade-out
 
 ## Two-Phase Streaming
 
@@ -165,7 +167,7 @@ for chunk, sr in model.stream_generate_voice_clone(
 | `first_chunk_emit_every` | 0 | Phase 1 emit interval (0 = disabled) |
 | `first_chunk_decode_window` | 48 | Phase 1 decode window |
 | `first_chunk_frames` | 48 | Switch to phase 2 after N frames |
-| `use_optimized_decode` | True | Use torch.compile/CUDA graph optimized decode |
+| `repetition_penalty` | 1.0 | Penalizes repeated tokens (1.0 = disabled). Increase toward 1.05 if you hear looping artifacts |
 
 ## Installation
 
