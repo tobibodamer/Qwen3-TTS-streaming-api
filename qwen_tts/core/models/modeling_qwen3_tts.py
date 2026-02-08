@@ -2873,7 +2873,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Trim END of chunk - this region will be replaced by next chunk's crossfade
             # Don't trim if chunk would become too small
-            if len(chunk) > blend_samples * 2:
+            if blend_samples > 0 and len(chunk) > blend_samples * 2:
                 chunk = chunk[:-blend_samples]
 
             total_frames_emitted = len(codes_buffer)  # Mark these frames as emitted
@@ -3206,7 +3206,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
                 decoded_tails[b] = chunk.copy()
 
-                if len(chunk) > blend_samples * 2:
+                if blend_samples > 0 and len(chunk) > blend_samples * 2:
                     chunk = chunk[:-blend_samples]
 
                 total_frames_emitted[b] = len(codes_buffers[b])
