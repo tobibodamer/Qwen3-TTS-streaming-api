@@ -11,10 +11,10 @@ From [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streamin
 
 Added in this fork:
 - **Two-phase streaming** - faster first-chunk latency
-- **Repetition penalty for streaming** - prevents token loops that cause looping audio and runaway generation. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path (which defaults to 1.05)
-- **Multiple EOS token detection** - broader termination coverage for reliable generation stopping
+- **Multiple EOS token detection** - broader termination coverage for reliable generation stopping. Fixes sped-up audio and runaway generation in streaming
 - **Hann window crossfade** - click-free chunk boundaries with proper fade-in/fade-out
 - **Batch streaming** - process multiple texts in a single batched transformer pass with `batch_stream_generate_voice_clone()`, with per-item state management and independent EOS detection
+- **Repetition penalty for streaming** - prevents token loops that cause looping audio and runaway generation. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path (which defaults to 1.05)
 
 ## Installation
 
@@ -119,7 +119,8 @@ Items finish independently (per-item EOS detection), but the generator keeps yie
 | `first_chunk_emit_every` | 0 | Phase 1 emit interval (0 = disabled) |
 | `first_chunk_decode_window` | 48 | Phase 1 decode window |
 | `first_chunk_frames` | 48 | Switch to phase 2 after N frames |
-| `repetition_penalty` | 1.0 | Penalizes repeated tokens (1.0 = disabled). Fixes streaming runaway voice speed issues |
+| `repetition_penalty` | 1.0 | Penalizes repeated tokens (1.0 = disabled) |
+| `repetition_penalty_window` | 100 | Only penalize tokens from the last N steps (0 = unlimited) |
 
 ## Two-Phase Streaming
 
