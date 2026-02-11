@@ -2805,7 +2805,13 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         decoded_tail: Optional[np.ndarray] = None
         frames_since_emit = 0
         total_frames_emitted = 0  # Track how many frames we've already emitted audio for
-        generated_token_ids: list[int] = [token.item()]  # Track first-codebook tokens for repetition penalty
+
+        # GPU-resident circular buffer for repetition penalty
+        if repetition_penalty != 1.0:
+            rp_window = repetition_penalty_window if repetition_penalty_window > 0 else max_frames
+            rp_history = torch.full((1, rp_window), vocab_size, device=token.device, dtype=torch.long)
+            rp_history[0, 0] = token[0]
+            rp_step = 1
 
         # Pre-compute decode constants
         samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
@@ -2876,20 +2882,27 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 # Sample next token for first codebook
                 step_logits = step_out.logits[:, -1, :]
 
-                # Apply repetition penalty to recently generated tokens (windowed)
-                if repetition_penalty != 1.0 and len(generated_token_ids) > 0:
-                    recent = generated_token_ids[-repetition_penalty_window:] if repetition_penalty_window > 0 else generated_token_ids
-                    prev_ids = torch.tensor(list(set(recent)), device=step_logits.device)
-                    scores = torch.gather(step_logits[0], 0, prev_ids)
-                    scores = torch.where(scores > 0, scores / repetition_penalty, scores * repetition_penalty)
-                    step_logits[0].scatter_(0, prev_ids, scores)
+                # Apply repetition penalty via GPU-resident circular buffer
+                if repetition_penalty != 1.0:
+                    presence = torch.zeros(1, vocab_size + 1, device=step_logits.device, dtype=torch.bool)
+                    presence.scatter_(1, rp_history, True)
+                    penalty_mask = presence[:, :vocab_size]
+                    penalized = torch.where(
+                        step_logits > 0,
+                        step_logits / repetition_penalty,
+                        step_logits * repetition_penalty,
+                    )
+                    step_logits = torch.where(penalty_mask, penalized, step_logits)
 
                 if do_sample:
                     token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens)
                 else:
                     token = torch.argmax(step_logits, dim=-1)
 
-                generated_token_ids.append(token.item())
+                if repetition_penalty != 1.0:
+                    pos = rp_step % rp_window
+                    rp_history[0, pos] = token[0]
+                    rp_step += 1
 
                 frames_since_emit += 1
 
@@ -3076,6 +3089,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         first_chunk_frames: int = 48,  # Switch to stable after this many frames
         # Async decode: overlap AR and speech decoder on separate CUDA streams
         async_decode: bool = False,
+        # Batch compaction: remove finished items from GPU tensors
+        compact_finished: bool = False,
     ) -> Generator[tuple[list[np.ndarray], int], None, None]:
         """
         Batch streaming audio generation, yielding lists of PCM chunks as they are generated.
@@ -3083,6 +3098,13 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         All batch items advance in lockstep through the transformer. Per-item state is
         maintained for codes buffers, decoded tails, repetition penalty tracking,
         ref_code contexts, and EOS detection.
+
+        .. note::
+            Benchmarks show non-streaming batch (``generate_voice_clone(text=List[str])``)
+            achieves higher throughput (5.2x vs 4.3x) with much lower latency. Batch streaming
+            has high TTFB (~8.6s for 3 paragraphs) due to lockstep prefill. Prefer non-streaming
+            batch for offline/buffered generation. Reserve this method for cases requiring
+            incremental chunk delivery of multiple items simultaneously.
 
         Args:
             input_ids: List of input token tensors (one per batch item)
@@ -3189,12 +3211,22 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         codes_buffers: list[list[torch.Tensor]] = [[] for _ in range(B)]
         decoded_tails: list[Optional[np.ndarray]] = [None] * B
         total_frames_emitted: list[int] = [0] * B
-        generated_token_ids: list[list[int]] = [[token[b].item()] for b in range(B)]
         finished: list[bool] = [False] * B
         sr = 24000  # default sample rate, updated on first decode
 
-        # Shared frame counter (items advance in lockstep)
-        frames_since_emit = 0
+        # GPU-resident circular buffer for vectorized repetition penalty
+        if repetition_penalty != 1.0:
+            rp_window = repetition_penalty_window if repetition_penalty_window > 0 else max_frames
+            rp_history = torch.full((B, rp_window), vocab_size, device=token.device, dtype=torch.long)
+            rp_history[:, 0] = token  # first sampled token
+            rp_step = 1
+
+        # Per-item frame counter (items advance in lockstep but counters survive compaction)
+        frames_since_emit = [0] * B
+
+        # Batch compaction state: compact idx → original batch idx
+        active_to_orig = list(range(B))
+        B_active = B
 
         # Pre-compute constants for post-processing
         samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
@@ -3255,41 +3287,83 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 # Get codec_ids [B, num_code_groups]
                 codec_ids = step_out.hidden_states[1]
 
-                # Per-item EOS check and codes buffer append
-                for b in range(B):
-                    if finished[b]:
+                # Per-item EOS check and codes buffer append (using compact indices)
+                newly_finished_compact = set()
+                for ci in range(B_active):
+                    orig = active_to_orig[ci]
+                    if finished[orig]:
                         continue
-                    if codec_ids[b, 0].item() in eos_ids:
-                        finished[b] = True
+                    if codec_ids[ci, 0].item() in eos_ids:
+                        finished[orig] = True
+                        newly_finished_compact.add(ci)
                         continue
-                    codes_buffers[b].append(codec_ids[b].detach())
+                    codes_buffers[orig].append(codec_ids[ci].detach())
 
                 if all(finished):
                     break
 
-                # Sample next token with per-item repetition penalty
-                step_logits = step_out.logits[:, -1, :].clone()  # [B, vocab]
+                # --- Batch compaction: remove finished items from GPU tensors ---
+                compacted_this_step = False
+                if compact_finished and newly_finished_compact:
+                    still_active = [ci for ci in range(B_active) if ci not in newly_finished_compact]
+                    if still_active and len(still_active) < B_active:
+                        compacted_this_step = True
+                        active_idx = torch.tensor(still_active, device=token.device)
+
+                        # Slice KV cache along batch dimension (works for all cache types)
+                        past_key_values.reorder_cache(active_idx)
+
+                        # Slice other batch-dimension tensors
+                        past_hidden = past_hidden.index_select(0, active_idx)
+                        trailing_text_hiddens = trailing_text_hiddens.index_select(0, active_idx)
+
+                        if self.talker.rope_deltas is not None:
+                            self.talker.rope_deltas = self.talker.rope_deltas.index_select(0, active_idx)
+
+                        if repetition_penalty != 1.0:
+                            rp_history = rp_history.index_select(0, active_idx)
+
+                        active_to_orig = [active_to_orig[ci] for ci in still_active]
+                        B_active = len(active_to_orig)
+
+                # Sample next token with vectorized repetition penalty
+                step_logits = step_out.logits[:, -1, :].clone()  # [old_B_active, vocab]
+                if compacted_this_step:
+                    step_logits = step_logits.index_select(0, active_idx)
 
                 if repetition_penalty != 1.0:
-                    for b in range(B):
-                        if finished[b] or len(generated_token_ids[b]) == 0:
-                            continue
-                        recent = generated_token_ids[b][-repetition_penalty_window:] if repetition_penalty_window > 0 else generated_token_ids[b]
-                        prev_ids = torch.tensor(list(set(recent)), device=step_logits.device)
-                        scores = torch.gather(step_logits[b], 0, prev_ids)
-                        scores = torch.where(scores > 0, scores / repetition_penalty, scores * repetition_penalty)
-                        step_logits[b].scatter_(0, prev_ids, scores)
+                    presence = torch.zeros(B_active, vocab_size + 1, device=step_logits.device, dtype=torch.bool)
+                    presence.scatter_(1, rp_history, True)
+                    penalty_mask = presence[:, :vocab_size]
+
+                    # Zero out finished items (only needed when not compacting)
+                    if not compact_finished:
+                        for ci in range(B_active):
+                            orig = active_to_orig[ci]
+                            if finished[orig]:
+                                penalty_mask[ci] = False
+
+                    penalized = torch.where(
+                        step_logits > 0,
+                        step_logits / repetition_penalty,
+                        step_logits * repetition_penalty,
+                    )
+                    step_logits = torch.where(penalty_mask, penalized, step_logits)
 
                 if do_sample:
                     token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens)
                 else:
                     token = torch.argmax(step_logits, dim=-1)
 
+                if repetition_penalty != 1.0:
+                    pos = rp_step % rp_window
+                    rp_history[:, pos] = token
+                    rp_step += 1
+
+                # Per-item frame counter increment
                 for b in range(B):
                     if not finished[b]:
-                        generated_token_ids[b].append(token[b].item())
-
-                frames_since_emit += 1
+                        frames_since_emit[b] += 1
 
                 # Two-phase streaming: use any active item's buffer length for phase detection
                 # (all active items have same buffer length since they advance in lockstep)
@@ -3308,9 +3382,16 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                     current_decode_window = decode_window_frames
                     current_use_optimized = use_optimized_decode
 
-                if frames_since_emit < current_emit_every:
+                max_since_emit = max(
+                    (frames_since_emit[b] for b in range(B) if not finished[b]),
+                    default=0,
+                )
+                if max_since_emit < current_emit_every:
                     continue
-                frames_since_emit = 0
+                # Reset all active items' counters
+                for b in range(B):
+                    if not finished[b]:
+                        frames_since_emit[b] = 0
 
                 # Phase 1: Collect windows for all active items
                 active_indices: list[int] = []
@@ -3537,6 +3618,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 pending_decode[0].synchronize()
             if decode_stream is not None:
                 torch.cuda.current_stream().wait_stream(decode_stream)
+            # Prevent stale batch-sized tensor from lingering after compaction
+            self.talker.rope_deltas = None
 
 
 __all__ = [
