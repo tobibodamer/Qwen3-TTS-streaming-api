@@ -1,0 +1,8 @@
+hf_cache/
+voices/
+__pycache__/
+*.wav
+*.txt
+.git/
+.github/
+api/main.py.bak
