@@ -8,6 +8,9 @@ services:
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - ./voices:/app/voices
+    environment:
+      - MODEL_PATH=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+      - VOICES_DIR=voices
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s

@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import torch
 
@@ -13,29 +14,21 @@ import io
 import soundfile as sf
 from typing import Optional, Dict
 import os
-import traceback
 import numpy as np
 import threading
 import queue
 
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-# )
-# logger = logging.getLogger(__name__)
-
 logger = logging.getLogger("uvicorn.error")
-logger.propagate = False
 
 class SpeechRequest(BaseModel):
     model: str
     input: str
     voice: str
-    response_format: Optional[str] = "wav"
+    response_format: Optional[str] = "pcm" # Default to raw PCM for streaming
     language: Optional[str] = None
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model_path = os.getenv("MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+model_path = os.getenv("MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 VOICES_DIR = os.getenv("VOICES_DIR", "voices")
 
 tts_model = Qwen3TTSModel.from_pretrained(
@@ -53,6 +46,8 @@ tts_model.enable_streaming_optimizations(
 # In-memory cache for voice prompts
 voice_cache: Dict[str, dict] = {}
 model_ready = False
+
+sem = asyncio.Semaphore(1)
     
 # Warmup: run dummy generation to initialize torch.compile and CUDA graphs
 def warmup_model(prompt):
@@ -121,79 +116,102 @@ async def lifespan(app: FastAPI):
     
 app = FastAPI(lifespan=lifespan)
 
-def audio_stream_generator(text, language, voice_clone_prompt, response_format):
-    print(f"Starting audio generation for text: {text[:50]}...")
+async def audio_stream_generator(text, language, voice_clone_prompt, response_format, request: Request):
+    async with sem:
+        print(f"Starting audio generation for text: {text[:50]}...")
     
-    audio_queue = queue.Queue()
-    sample_rate_holder = [None]  # To capture sample rate from producer
-    
-    def producer():
-        """Generate audio chunks into queue."""
+        audio_queue = queue.Queue()
+        sample_rate_holder = [None]
+        stop_event = threading.Event()  # Signal to stop generation
+        
+        def producer():
+            """Generate audio chunks into queue (runs in background thread)."""
+            try:
+                for audio_chunk, sample_rate in tts_model.stream_generate_voice_clone(
+                    text=text,
+                    language=language,
+                    voice_clone_prompt=voice_clone_prompt,
+                    overlap_samples=512,
+                    emit_every_frames=12,
+                    decode_window_frames=80,
+                    first_chunk_emit_every=5,
+                    first_chunk_decode_window=48,
+                    first_chunk_frames=48,
+                ):
+                    # Check if we should stop
+                    if stop_event.is_set():
+                        logger.info("Stop signal received, halting TTS generation.")
+                        break
+                    
+                    if sample_rate_holder[0] is None:
+                        sample_rate_holder[0] = sample_rate
+                    
+                    audio_queue.put((audio_chunk, sample_rate))
+                    
+            except Exception as e:
+                logger.exception(f"TTS generation error: {e}")
+                audio_queue.put(e)
+            finally:
+                audio_queue.put(None)  # Sentinel
+        
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
+        
+        fmt = response_format.lower()
+        header_sent = False
+        
         try:
-            for audio_chunk, sample_rate in tts_model.stream_generate_voice_clone(
-                text=text,
-                language=language,
-                voice_clone_prompt=voice_clone_prompt,
-                overlap_samples=512,
-                # Phase 2 settings (stable)
-                emit_every_frames=12,
-                decode_window_frames=80,
-                # Phase 1 settings (fast first chunk)
-                first_chunk_emit_every=5,
-                first_chunk_decode_window=48,
-                first_chunk_frames=48,
-            ):
-                if sample_rate_holder[0] is None:
-                    sample_rate_holder[0] = sample_rate
-                audio_queue.put(audio_chunk)
-        except Exception as e:
-            logger.exception(f"TTS generation error for text '{text[:50]}': {type(e).__name__}: {e}")
-        finally:
-            audio_queue.put(None)  # Sentinel to signal completion
-
-    thread = threading.Thread(target=producer, daemon=True)
-    thread.start()
-
-    fmt = response_format.lower()
-    header_sent = False
-    
-    while True:
-        try:
-            item = audio_queue.get(timeout=30)  # Wait up to 30s for a chunk
-            if item is None:
-                break
-            if isinstance(item, Exception):
-                raise item
-            
-            chunk: np.ndarray = item
-            sr = sample_rate_holder[0]
-            buffer = io.BytesIO()
-            
-            logger.debug(f"Generated chunk of length {chunk.size}")
-            
-            if fmt == "wav":
-                if not header_sent:
-                    sf.write(buffer, chunk, sr, format="WAV", subtype="PCM_16")
-                    header_sent = True
-                    yield buffer.getvalue()
-                else:
-                    pcm_data = (chunk * 32767).astype(np.int16)
-                    yield pcm_data.tobytes()
-            elif fmt in ["pcm", "raw"]:
-                pcm_data = (chunk * 32767).astype(np.int16)
-                yield pcm_data.tobytes()
-            else:
-                sf.write(buffer, chunk, sr, format=fmt.upper())
-                yield buffer.getvalue()
+            while True:
+                # Check for disconnect
+                if await request.is_disconnected():
+                    logger.info("Client disconnected, signaling stop.")
+                    stop_event.set()  # Signal the producer to stop
+                    break
                 
-        except queue.Empty:
-            logger.warning("Timed out waiting for audio chunk")
-            break
+                try:
+                    item = audio_queue.get(timeout=0.1)
+                    
+                    if item is None:  # Generation complete
+                        break
+                        
+                    if isinstance(item, Exception):
+                        raise item
+                    
+                    audio_chunk, sample_rate = item
+                    chunk: np.ndarray = audio_chunk
+                    sr = sample_rate
+                    buffer = io.BytesIO()
+                    
+                    logger.debug(f"Generated chunk of length {chunk.size}")
+                    
+                    if fmt == "wav":
+                        if not header_sent:
+                            sf.write(buffer, chunk, sr, format="WAV", subtype="PCM_16")
+                            header_sent = True
+                            yield buffer.getvalue()
+                        else:
+                            pcm_data = (chunk * 32767).astype(np.int16)
+                            yield pcm_data.tobytes()
+                    elif fmt in ["pcm", "raw"]:
+                        pcm_data = (chunk * 32767).astype(np.int16)
+                        yield pcm_data.tobytes()
+                    else:
+                        sf.write(buffer, chunk, sr, format=fmt.upper())
+                        yield buffer.getvalue()
+                        
+                except queue.Empty:
+                    continue
+                    
         except Exception as e:
             logger.error(f"ERROR in consumer: {str(e)}")
-            break
-
-    logger.info("Generation complete.")
+            stop_event.set()  # Signal stop on any error
+            raise
+        finally:
+            # Ensure we always signal stop and wait for thread cleanup
+            stop_event.set()
+            thread.join(timeout=2.0)  # Wait up to 2s for clean shutdown
+            
+        logger.info("Generation complete.")
     
 def _list_voices():
     voices: list[str] = []
@@ -216,8 +234,15 @@ def list_voices():
     return {"voices": voices}
 
 @app.post("/v1/audio/speech")
-def create_speech(request: SpeechRequest):
+async def create_speech(request: SpeechRequest, r: Request):
     logger.debug(f"Received speech request: {request}")
+    
+    if not model_ready:
+        raise HTTPException(status_code=503, detail="Model is not ready")
+    
+    if request.response_format not in ["pcm", "raw"]:
+        raise HTTPException(status_code=400, detail="Unsupported response format. Use 'pcm' for streaming.")
+    
     try:
         voice_prompt = get_voice_prompt(request.voice)
     except HTTPException as e:
@@ -228,6 +253,12 @@ def create_speech(request: SpeechRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     return StreamingResponse(
-        audio_stream_generator(request.input, request.language, voice_prompt, request.response_format),
+        audio_stream_generator(
+            request.input, 
+            request.language, 
+            voice_prompt, 
+            request.response_format, 
+            r
+        ),
         media_type=f"audio/{request.response_format}"
     )

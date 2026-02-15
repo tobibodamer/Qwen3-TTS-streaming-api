@@ -1,56 +1,65 @@
-FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel AS base
+# Build stage - uses devel image for compilation
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel AS builder
 
 # Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CMAKE_ARGS="-DGGML_CUDA=on"
 ENV FORCE_CMAKE=1
 
-# Install system dependencies
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3-pip \
     python3-dev \
-    sox \
-    libsndfile1 \
     git \
     curl \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Set python3 as default python
-RUN ln -s /usr/bin/python3 /usr/bin/python
-
-# Set Huggingface cache
-#ENV HF_HOME=/cache
+# Set pip cache
 ENV PIP_CACHE_DIR=/cache/pip
 WORKDIR /app
-
-# --- Dependency Stage ---
-FROM base AS dependencies
 
 # Upgrade build tools
 RUN pip install --no-cache-dir -U pip setuptools wheel tomli
 
-# Install torch with CUDA 12.1 support (Large layer, cached separately)
-#RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# Copy only pyproject.toml to install dependencies
+# Copy only pyproject.toml to install dependencies (cached layer)
 COPY pyproject.toml .
 
-# Extract and install dependencies from pyproject.toml
-RUN python3 -c "import tomli; d = tomli.load(open('pyproject.toml', 'rb')); print('\n'.join(d['project']['dependencies']))" > requirements.txt && \
+# Extract and install dependencies from pyproject.toml (cached layer)
+RUN python -c "import tomli; d = tomli.load(open('pyproject.toml', 'rb')); print('\n'.join(d['project']['dependencies']))" > requirements.txt && \
     pip install --no-cache-dir -r requirements.txt
 
-# Install flash-attention (Slow to build/install, cached here)
+# Install flash-attention (cached layer - slow build)
 RUN pip install --no-cache-dir flash-attn --no-build-isolation
 
-# --- Final Stage ---
-FROM dependencies AS runtime
-
-# Copy the rest of the application
+# Copy the rest of the application (this layer changes frequently)
 COPY . .
 
-# Install the project itself
+# Install the project itself (fast, only reruns when code changes)
 RUN pip install --no-cache-dir .
+
+# Runtime stage - uses smaller runtime image
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime AS runtime
+
+# Avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install runtime dependencies INCLUDING build tools for Triton
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    sox \
+    libsndfile1 \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Huggingface cache
+ENV PIP_CACHE_DIR=/cache/pip
+WORKDIR /app
+
+# Copy Python packages from builder (includes all dependencies)
+COPY --from=builder /opt/conda /opt/conda
+
+# Copy application code from builder (includes installed project)
+COPY --from=builder /app /app
 
 # Expose port
 EXPOSE 8000

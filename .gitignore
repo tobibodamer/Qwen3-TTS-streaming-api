@@ -22,4 +22,5 @@ wheels/
 .vscode/
 venv/
 env/
-voices/
+voices/*
+!voices/kuklina-1.*
